@@ -7,7 +7,7 @@ github:
     wiki: true
     issues: true
     projects: true
-    discusions: true
+    discussions: true
 
 #  protected_branches:
 #    main:
@@ -18,15 +18,15 @@ github:
 #      required_pull_request_reviews:
 #        dismiss_stale_reviews: false
 #        required_approving_review_count: 1
-      
+
       # squash or rebase must be allowed in the repo for this setting to be set to true.
 #      required_linear_history: false
-      
+
 #      required_signatures: false
-      
+
       # requires all conversations to be resolved before merging is possible
 #      required_conversation_resolution: false
-      
+
   dependabot_alerts:  true
   dependabot_updates: false
 
