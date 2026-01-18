@@ -15,9 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared utilities across sketches.
+//! Data structures and functions that may be used across all the sketch families.
+
+// public common components for datasketches crate
+mod num_std_dev;
+mod resize;
+pub use self::num_std_dev::NumStdDev;
+pub use self::resize::ResizeFactor;
 
 pub mod random;
 
 pub use self::random::RandomSource;
 pub use self::random::XorShift64;
+
+// private to datasketches crate
+pub(crate) mod binomial_bounds;
