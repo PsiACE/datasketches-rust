@@ -118,6 +118,7 @@ pub(crate) fn build_sorted_view<T: KllItem>(levels: &[Vec<T>]) -> SortedView<T> 
     SortedView::new(entries)
 }
 
+#[track_caller]
 fn check_split_points<T: KllItem>(split_points: &[T]) {
     let len = split_points.len();
     if len == 1 && T::is_nan(&split_points[0]) {

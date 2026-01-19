@@ -42,7 +42,7 @@ use crate::codec::SketchSlice;
 use crate::error::Error;
 
 /// Trait implemented by item types supported by [`KllSketch`].
-pub(crate) trait KllItem: Clone {
+pub trait KllItem: Clone {
     /// Compare two items.
     fn cmp(a: &Self, b: &Self) -> Ordering;
 
@@ -50,7 +50,9 @@ pub(crate) trait KllItem: Clone {
     fn is_nan(_value: &Self) -> bool {
         false
     }
+}
 
+pub(crate) trait KllSerde: KllItem {
     /// Serialized size in bytes.
     fn serialized_size(value: &Self) -> usize;
 
@@ -64,7 +66,6 @@ pub(crate) trait KllItem: Clone {
 /// KLL sketch for estimating quantiles and ranks.
 ///
 /// See the [kll module level documentation](crate::kll) for more.
-#[allow(private_bounds)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct KllSketch<T: KllItem> {
     k: u16,
@@ -83,7 +84,6 @@ impl<T: KllItem> Default for KllSketch<T> {
     }
 }
 
-#[allow(private_bounds)]
 impl<T: KllItem> KllSketch<T> {
     /// Creates a new sketch with the given value of k.
     ///
@@ -103,7 +103,16 @@ impl<T: KllItem> KllSketch<T> {
             (MIN_K..=MAX_K).contains(&k),
             "k must be in [{MIN_K}, {MAX_K}], got {k}"
         );
-        Self::make(k, k, 0, vec![Vec::new()], None, None, false)
+        Self {
+            k,
+            m: DEFAULT_M,
+            min_k: k,
+            n: 0,
+            is_level_zero_sorted: false,
+            levels: vec![Vec::new()],
+            min_item: None,
+            max_item: None,
+        }
     }
 
     /// Returns parameter k used to configure this sketch.
@@ -237,223 +246,302 @@ impl<T: KllItem> KllSketch<T> {
     pub fn normalized_rank_error(&self, pmf: bool) -> f64 {
         normalized_rank_error(self.min_k, pmf)
     }
+}
 
-    /// Serializes the sketch to bytes.
-    pub fn serialize(&self) -> Vec<u8> {
-        let size = self.serialized_size();
-        let mut bytes = SketchBytes::with_capacity(size);
+fn serialized_size<T: KllSerde>(sketch: &KllSketch<T>) -> usize {
+    if sketch.is_empty() {
+        return EMPTY_SIZE_BYTES;
+    }
+    if sketch.n == 1 {
+        let item = &sketch.levels[0][0];
+        return DATA_START_SINGLE_ITEM + T::serialized_size(item);
+    }
 
-        let is_empty = self.is_empty();
-        let is_single_item = self.n == 1;
+    let mut size = DATA_START + sketch.levels.len() * 4;
+    if let Some(min_item) = &sketch.min_item {
+        size += T::serialized_size(min_item);
+    }
+    if let Some(max_item) = &sketch.max_item {
+        size += T::serialized_size(max_item);
+    }
+    for level in &sketch.levels {
+        for item in level {
+            size += T::serialized_size(item);
+        }
+    }
+    size
+}
 
-        let preamble_ints = if is_empty || is_single_item {
-            PREAMBLE_INTS_SHORT
+fn serialize_with_serde<T: KllSerde>(sketch: &KllSketch<T>) -> Vec<u8> {
+    let size = serialized_size(sketch);
+    let mut bytes = SketchBytes::with_capacity(size);
+
+    let is_empty = sketch.is_empty();
+    let is_single_item = sketch.n == 1;
+
+    let preamble_ints = if is_empty || is_single_item {
+        PREAMBLE_INTS_SHORT
+    } else {
+        PREAMBLE_INTS_FULL
+    };
+    let serial_version = if is_single_item {
+        SERIAL_VERSION_2
+    } else {
+        SERIAL_VERSION_1
+    };
+
+    let flags = (if is_empty { FLAG_EMPTY } else { 0 })
+        | (if sketch.is_level_zero_sorted {
+            FLAG_LEVEL_ZERO_SORTED
         } else {
-            PREAMBLE_INTS_FULL
-        };
-        let serial_version = if is_single_item {
-            SERIAL_VERSION_2
-        } else {
-            SERIAL_VERSION_1
-        };
+            0
+        })
+        | (if is_single_item { FLAG_SINGLE_ITEM } else { 0 });
 
-        let flags = (if is_empty { FLAG_EMPTY } else { 0 })
-            | (if self.is_level_zero_sorted {
-                FLAG_LEVEL_ZERO_SORTED
-            } else {
-                0
-            })
-            | (if is_single_item { FLAG_SINGLE_ITEM } else { 0 });
+    bytes.write_u8(preamble_ints);
+    bytes.write_u8(serial_version);
+    bytes.write_u8(KLL_FAMILY_ID);
+    bytes.write_u8(flags);
+    bytes.write_u16_le(sketch.k);
+    bytes.write_u8(sketch.m);
+    bytes.write_u8(0);
 
-        bytes.write_u8(preamble_ints);
-        bytes.write_u8(serial_version);
-        bytes.write_u8(KLL_FAMILY_ID);
-        bytes.write_u8(flags);
-        bytes.write_u16_le(self.k);
-        bytes.write_u8(self.m);
+    if is_empty {
+        return bytes.into_bytes();
+    }
+
+    if !is_single_item {
+        bytes.write_u64_le(sketch.n);
+        bytes.write_u16_le(sketch.min_k);
+        bytes.write_u8(sketch.levels.len() as u8);
         bytes.write_u8(0);
 
-        if is_empty {
-            return bytes.into_bytes();
+        let level_offsets = sketch.level_offsets();
+        for offset in level_offsets.iter().take(sketch.levels.len()) {
+            bytes.write_u32_le(*offset);
         }
 
-        if !is_single_item {
-            bytes.write_u64_le(self.n);
-            bytes.write_u16_le(self.min_k);
-            bytes.write_u8(self.levels.len() as u8);
-            bytes.write_u8(0);
-
-            let level_offsets = self.level_offsets();
-            for offset in level_offsets.iter().take(self.levels.len()) {
-                bytes.write_u32_le(*offset);
-            }
-
-            if let Some(min_item) = &self.min_item {
-                T::serialize(min_item, &mut bytes);
-            }
-            if let Some(max_item) = &self.max_item {
-                T::serialize(max_item, &mut bytes);
-            }
+        if let Some(min_item) = &sketch.min_item {
+            T::serialize(min_item, &mut bytes);
         }
-
-        for level in &self.levels {
-            for item in level {
-                T::serialize(item, &mut bytes);
-            }
+        if let Some(max_item) = &sketch.max_item {
+            T::serialize(max_item, &mut bytes);
         }
+    }
 
-        bytes.into_bytes()
+    for level in &sketch.levels {
+        for item in level {
+            T::serialize(item, &mut bytes);
+        }
+    }
+
+    bytes.into_bytes()
+}
+
+fn deserialize_with_serde<T: KllSerde>(bytes: &[u8]) -> Result<KllSketch<T>, Error> {
+    fn make_error(tag: &'static str) -> impl FnOnce(std::io::Error) -> Error {
+        move |_| Error::insufficient_data(tag)
+    }
+
+    let mut cursor = SketchSlice::new(bytes);
+
+    let preamble_ints = cursor.read_u8().map_err(make_error("preamble_ints"))?;
+    let serial_version = cursor.read_u8().map_err(make_error("serial_version"))?;
+    let family_id = cursor.read_u8().map_err(make_error("family_id"))?;
+    let flags = cursor.read_u8().map_err(make_error("flags"))?;
+    let k = cursor.read_u16_le().map_err(make_error("k"))?;
+    let m = cursor.read_u8().map_err(make_error("m"))?;
+    let _unused = cursor.read_u8().map_err(make_error("unused"))?;
+
+    if m != DEFAULT_M {
+        return Err(Error::deserial(format!(
+            "invalid m: expected {DEFAULT_M}, got {m}"
+        )));
+    }
+    if family_id != KLL_FAMILY_ID {
+        return Err(Error::invalid_family(KLL_FAMILY_ID, family_id, "KLL"));
+    }
+    let is_empty = (flags & FLAG_EMPTY) != 0;
+    let is_single_item = (flags & FLAG_SINGLE_ITEM) != 0;
+    let is_level_zero_sorted = (flags & FLAG_LEVEL_ZERO_SORTED) != 0;
+    if is_empty || is_single_item {
+        if preamble_ints != PREAMBLE_INTS_SHORT {
+            return Err(Error::invalid_preamble_ints(
+                PREAMBLE_INTS_SHORT,
+                preamble_ints,
+            ));
+        }
+    } else if preamble_ints != PREAMBLE_INTS_FULL {
+        return Err(Error::invalid_preamble_ints(
+            PREAMBLE_INTS_FULL,
+            preamble_ints,
+        ));
+    }
+    let expected_version = if is_single_item {
+        SERIAL_VERSION_2
+    } else {
+        SERIAL_VERSION_1
+    };
+    if serial_version != expected_version {
+        return Err(Error::unsupported_serial_version(
+            expected_version,
+            serial_version,
+        ));
+    }
+
+    if !(MIN_K..=MAX_K).contains(&k) {
+        return Err(Error::deserial(format!("k out of range: {k}")));
+    }
+
+    if is_empty {
+        return Ok(KllSketch::make(
+            k,
+            k,
+            0,
+            vec![Vec::new()],
+            None,
+            None,
+            is_level_zero_sorted,
+        ));
+    }
+
+    let (n, min_k, num_levels) = if is_single_item {
+        (1u64, k, 1usize)
+    } else {
+        let n = cursor.read_u64_le().map_err(make_error("n"))?;
+        let min_k = cursor.read_u16_le().map_err(make_error("min_k"))?;
+        let num_levels = cursor.read_u8().map_err(make_error("num_levels"))?;
+        let _unused = cursor.read_u8().map_err(make_error("unused2"))?;
+        (n, min_k, num_levels as usize)
+    };
+
+    if num_levels == 0 {
+        return Err(Error::deserial("num_levels must be > 0"));
+    }
+    if min_k < MIN_K || min_k > k {
+        return Err(Error::deserial(format!(
+            "min_k must be in [{MIN_K}, {k}], got {min_k}"
+        )));
+    }
+
+    let capacity = compute_total_capacity(k, m, num_levels) as u32;
+    let mut level_offsets = Vec::with_capacity(num_levels + 1);
+    if !is_single_item {
+        for _ in 0..num_levels {
+            let offset = cursor.read_u32_le().map_err(make_error("levels"))?;
+            level_offsets.push(offset);
+        }
+    } else {
+        level_offsets.push(capacity - 1);
+    }
+    level_offsets.push(capacity);
+
+    if level_offsets.is_empty() {
+        return Err(Error::deserial("levels array is empty"));
+    }
+    if level_offsets[0] > capacity {
+        return Err(Error::deserial("levels[0] exceeds capacity"));
+    }
+    for window in level_offsets.windows(2) {
+        if window[1] < window[0] {
+            return Err(Error::deserial("levels array must be non-decreasing"));
+        }
+    }
+    let last = *level_offsets.last().unwrap();
+    if last != capacity {
+        return Err(Error::deserial("levels last offset must equal capacity"));
+    }
+
+    let min_item = if is_single_item {
+        None
+    } else {
+        Some(T::deserialize(&mut cursor)?)
+    };
+    let max_item = if is_single_item {
+        None
+    } else {
+        Some(T::deserialize(&mut cursor)?)
+    };
+
+    let mut levels = Vec::with_capacity(num_levels);
+    for level in 0..num_levels {
+        let size = (level_offsets[level + 1] - level_offsets[level]) as usize;
+        let mut items = Vec::with_capacity(size);
+        for _ in 0..size {
+            items.push(T::deserialize(&mut cursor)?);
+        }
+        levels.push(items);
+    }
+
+    let mut sketch = KllSketch::make(
+        k,
+        min_k,
+        n,
+        levels,
+        min_item,
+        max_item,
+        is_level_zero_sorted,
+    );
+
+    if is_single_item {
+        if let Some(item) = sketch.levels[0].first().cloned() {
+            sketch.min_item = Some(item.clone());
+            sketch.max_item = Some(item);
+        }
+    }
+
+    Ok(sketch)
+}
+
+impl KllSketch<f32> {
+    /// Serializes the sketch to bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        serialize_with_serde(self)
     }
 
     /// Deserializes a sketch from bytes.
-    pub fn deserialize(bytes: &[u8]) -> Result<KllSketch<T>, Error> {
-        fn make_error(tag: &'static str) -> impl FnOnce(std::io::Error) -> Error {
-            move |_| Error::insufficient_data(tag)
-        }
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        deserialize_with_serde(bytes)
+    }
+}
 
-        let mut cursor = SketchSlice::new(bytes);
-
-        let preamble_ints = cursor.read_u8().map_err(make_error("preamble_ints"))?;
-        let serial_version = cursor.read_u8().map_err(make_error("serial_version"))?;
-        let family_id = cursor.read_u8().map_err(make_error("family_id"))?;
-        let flags = cursor.read_u8().map_err(make_error("flags"))?;
-        let k = cursor.read_u16_le().map_err(make_error("k"))?;
-        let m = cursor.read_u8().map_err(make_error("m"))?;
-        let _unused = cursor.read_u8().map_err(make_error("unused"))?;
-
-        if m != DEFAULT_M {
-            return Err(Error::deserial(format!(
-                "invalid m: expected {DEFAULT_M}, got {m}"
-            )));
-        }
-        if family_id != KLL_FAMILY_ID {
-            return Err(Error::invalid_family(KLL_FAMILY_ID, family_id, "KLL"));
-        }
-        if serial_version != SERIAL_VERSION_1 && serial_version != SERIAL_VERSION_2 {
-            return Err(Error::deserial(format!(
-                "invalid serial version: {serial_version}"
-            )));
-        }
-
-        let is_empty = (flags & FLAG_EMPTY) != 0;
-        let is_single_item = (flags & FLAG_SINGLE_ITEM) != 0;
-        let is_level_zero_sorted = (flags & FLAG_LEVEL_ZERO_SORTED) != 0;
-        if is_empty || is_single_item {
-            if preamble_ints != PREAMBLE_INTS_SHORT {
-                return Err(Error::deserial(format!(
-                    "invalid preamble ints: expected {PREAMBLE_INTS_SHORT}, got {preamble_ints}"
-                )));
-            }
-        } else if preamble_ints != PREAMBLE_INTS_FULL {
-            return Err(Error::deserial(format!(
-                "invalid preamble ints: expected {PREAMBLE_INTS_FULL}, got {preamble_ints}"
-            )));
-        }
-
-        if !(MIN_K..=MAX_K).contains(&k) {
-            return Err(Error::deserial(format!("k out of range: {k}")));
-        }
-
-        if is_empty {
-            return Ok(Self::make(
-                k,
-                k,
-                0,
-                vec![Vec::new()],
-                None,
-                None,
-                is_level_zero_sorted,
-            ));
-        }
-
-        let (n, min_k, num_levels) = if is_single_item {
-            (1u64, k, 1usize)
-        } else {
-            let n = cursor.read_u64_le().map_err(make_error("n"))?;
-            let min_k = cursor.read_u16_le().map_err(make_error("min_k"))?;
-            let num_levels = cursor.read_u8().map_err(make_error("num_levels"))?;
-            let _unused = cursor.read_u8().map_err(make_error("unused2"))?;
-            (n, min_k, num_levels as usize)
-        };
-
-        if num_levels == 0 {
-            return Err(Error::deserial("num_levels must be > 0"));
-        }
-        if min_k < MIN_K || min_k > k {
-            return Err(Error::deserial(format!(
-                "min_k must be in [{MIN_K}, {k}], got {min_k}"
-            )));
-        }
-
-        let capacity = compute_total_capacity(k, m, num_levels) as u32;
-        let mut level_offsets = Vec::with_capacity(num_levels + 1);
-        if !is_single_item {
-            for _ in 0..num_levels {
-                let offset = cursor.read_u32_le().map_err(make_error("levels"))?;
-                level_offsets.push(offset);
-            }
-        } else {
-            level_offsets.push(capacity - 1);
-        }
-        level_offsets.push(capacity);
-
-        if level_offsets.is_empty() {
-            return Err(Error::deserial("levels array is empty"));
-        }
-        if level_offsets[0] > capacity {
-            return Err(Error::deserial("levels[0] exceeds capacity"));
-        }
-        for window in level_offsets.windows(2) {
-            if window[1] < window[0] {
-                return Err(Error::deserial("levels array must be non-decreasing"));
-            }
-        }
-        let last = *level_offsets.last().unwrap();
-        if last != capacity {
-            return Err(Error::deserial("levels last offset must equal capacity"));
-        }
-
-        let min_item = if is_single_item {
-            None
-        } else {
-            Some(T::deserialize(&mut cursor)?)
-        };
-        let max_item = if is_single_item {
-            None
-        } else {
-            Some(T::deserialize(&mut cursor)?)
-        };
-
-        let mut levels = Vec::with_capacity(num_levels);
-        for level in 0..num_levels {
-            let size = (level_offsets[level + 1] - level_offsets[level]) as usize;
-            let mut items = Vec::with_capacity(size);
-            for _ in 0..size {
-                items.push(T::deserialize(&mut cursor)?);
-            }
-            levels.push(items);
-        }
-
-        let mut sketch = Self::make(
-            k,
-            min_k,
-            n,
-            levels,
-            min_item,
-            max_item,
-            is_level_zero_sorted,
-        );
-
-        if is_single_item {
-            if let Some(item) = sketch.levels[0].first().cloned() {
-                sketch.min_item = Some(item.clone());
-                sketch.max_item = Some(item);
-            }
-        }
-
-        Ok(sketch)
+impl KllSketch<f64> {
+    /// Serializes the sketch to bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        serialize_with_serde(self)
     }
 
+    /// Deserializes a sketch from bytes.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        deserialize_with_serde(bytes)
+    }
+}
+
+impl KllSketch<i64> {
+    /// Serializes the sketch to bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        serialize_with_serde(self)
+    }
+
+    /// Deserializes a sketch from bytes.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        deserialize_with_serde(bytes)
+    }
+}
+
+impl KllSketch<String> {
+    /// Serializes the sketch to bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        serialize_with_serde(self)
+    }
+
+    /// Deserializes a sketch from bytes.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        deserialize_with_serde(bytes)
+    }
+}
+
+impl<T: KllItem> KllSketch<T> {
     fn make(
         k: u16,
         min_k: u16,
@@ -492,30 +580,6 @@ impl<T: KllItem> KllSketch<T> {
             offsets.push(offset);
         }
         offsets
-    }
-
-    fn serialized_size(&self) -> usize {
-        if self.is_empty() {
-            return EMPTY_SIZE_BYTES;
-        }
-        if self.n == 1 {
-            let item = &self.levels[0][0];
-            return DATA_START_SINGLE_ITEM + T::serialized_size(item);
-        }
-
-        let mut size = DATA_START + self.levels.len() * 4;
-        if let Some(min_item) = &self.min_item {
-            size += T::serialized_size(min_item);
-        }
-        if let Some(max_item) = &self.max_item {
-            size += T::serialized_size(max_item);
-        }
-        for level in &self.levels {
-            for item in level {
-                size += T::serialized_size(item);
-            }
-        }
-        size
     }
 
     fn update_min_max(&mut self, item: &T) {
@@ -770,7 +834,9 @@ impl KllItem for f32 {
     fn is_nan(value: &Self) -> bool {
         value.is_nan()
     }
+}
 
+impl KllSerde for f32 {
     fn serialized_size(_value: &Self) -> usize {
         4
     }
@@ -794,7 +860,9 @@ impl KllItem for f64 {
     fn is_nan(value: &Self) -> bool {
         value.is_nan()
     }
+}
 
+impl KllSerde for f64 {
     fn serialized_size(_value: &Self) -> usize {
         8
     }
@@ -814,7 +882,9 @@ impl KllItem for i64 {
     fn cmp(a: &Self, b: &Self) -> Ordering {
         a.cmp(b)
     }
+}
 
+impl KllSerde for i64 {
     fn serialized_size(_value: &Self) -> usize {
         8
     }
@@ -834,7 +904,9 @@ impl KllItem for String {
     fn cmp(a: &Self, b: &Self) -> Ordering {
         a.cmp(b)
     }
+}
 
+impl KllSerde for String {
     fn serialized_size(value: &Self) -> usize {
         4 + value.len()
     }

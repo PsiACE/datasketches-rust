@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datasketches::kll::DEFAULT_K;
 use datasketches::kll::KllSketch;
+use datasketches::kll::MAX_K;
+use datasketches::kll::MIN_K;
 
-const DEFAULT_K: u16 = 200;
-const RANK_EPS_FOR_K_200: f64 = 0.0133;
 const NUMERIC_NOISE_TOLERANCE: f64 = 1e-6;
 
 fn assert_approx_eq(actual: f64, expected: f64, tolerance: f64) {
@@ -29,16 +30,20 @@ fn assert_approx_eq(actual: f64, expected: f64, tolerance: f64) {
     );
 }
 
+fn rank_eps(sketch: &KllSketch<f32>) -> f64 {
+    sketch.normalized_rank_error(false)
+}
+
 #[test]
 fn test_k_limits() {
-    let _min = KllSketch::<f32>::new(8);
-    let _max = KllSketch::<f32>::new(u16::MAX);
+    let _min = KllSketch::<f32>::new(MIN_K);
+    let _max = KllSketch::<f32>::new(MAX_K);
 }
 
 #[test]
 #[should_panic(expected = "k must be in")]
 fn test_k_too_small_panics() {
-    KllSketch::<f32>::new(7);
+    KllSketch::<f32>::new(MIN_K - 1);
 }
 
 #[test]
@@ -151,10 +156,11 @@ fn test_many_items_estimation_mode_rank_error() {
     assert_eq!(sketch.min_item().cloned(), Some(0.0));
     assert_eq!(sketch.max_item().cloned(), Some((n - 1) as f32));
 
+    let rank_eps = rank_eps(&sketch);
     for i in (0..n).step_by(10) {
         let true_rank = i as f64 / n as f64;
         let rank = sketch.rank(&(i as f32), false).unwrap();
-        assert_approx_eq(rank, true_rank, RANK_EPS_FOR_K_200);
+        assert_approx_eq(rank, true_rank, rank_eps);
     }
 
     assert!(sketch.num_retained() > 0);
@@ -239,7 +245,8 @@ fn test_merge() {
     assert_eq!(sketch1.min_item().cloned(), Some(0.0));
     assert_eq!(sketch1.max_item().cloned(), Some((2 * n - 1) as f32));
     let median = sketch1.quantile(0.5, true).unwrap();
-    assert_approx_eq(median as f64, n as f64, n as f64 * RANK_EPS_FOR_K_200);
+    let rank_eps = rank_eps(&sketch1);
+    assert_approx_eq(median as f64, n as f64, n as f64 * rank_eps);
 }
 
 #[test]
@@ -266,7 +273,8 @@ fn test_merge_lower_k() {
         sketch2.normalized_rank_error(true)
     );
     let median = sketch1.quantile(0.5, true).unwrap();
-    assert_approx_eq(median as f64, n as f64, n as f64 * RANK_EPS_FOR_K_200);
+    let rank_eps = rank_eps(&sketch1);
+    assert_approx_eq(median as f64, n as f64, n as f64 * rank_eps);
 }
 
 #[test]
@@ -286,11 +294,8 @@ fn test_merge_exact_mode_lower_k() {
     assert_eq!(sketch1.min_item().cloned(), Some(0.0));
     assert_eq!(sketch1.max_item().cloned(), Some((n - 1) as f32));
     let median = sketch1.quantile(0.5, true).unwrap();
-    assert_approx_eq(
-        median as f64,
-        (n / 2) as f64,
-        (n as f64 / 2.0) * RANK_EPS_FOR_K_200,
-    );
+    let rank_eps = rank_eps(&sketch1);
+    assert_approx_eq(median as f64, (n / 2) as f64, (n as f64 / 2.0) * rank_eps);
 }
 
 #[test]

@@ -30,20 +30,14 @@ use std::fs;
 use std::path::PathBuf;
 
 use common::serialization_test_data;
+use datasketches::kll::DEFAULT_K;
 use datasketches::kll::KllSketch;
-
-const DEFAULT_K: usize = 200;
 
 fn test_f32_file(path: PathBuf, expected_n: usize) {
     let bytes = fs::read(&path).unwrap();
     let sketch = KllSketch::<f32>::deserialize(&bytes).unwrap();
 
-    assert_eq!(
-        sketch.k() as usize,
-        DEFAULT_K,
-        "wrong k in {}",
-        path.display()
-    );
+    assert_eq!(sketch.k(), DEFAULT_K, "wrong k in {}", path.display());
     assert_eq!(
         sketch.n() as usize,
         expected_n,
@@ -52,7 +46,7 @@ fn test_f32_file(path: PathBuf, expected_n: usize) {
     );
     assert_eq!(
         sketch.is_estimation_mode(),
-        expected_n > DEFAULT_K,
+        expected_n > DEFAULT_K as usize,
         "wrong estimation mode in {}",
         path.display()
     );
@@ -86,12 +80,7 @@ fn test_f64_file(path: PathBuf, expected_n: usize) {
     let bytes = fs::read(&path).unwrap();
     let sketch = KllSketch::<f64>::deserialize(&bytes).unwrap();
 
-    assert_eq!(
-        sketch.k() as usize,
-        DEFAULT_K,
-        "wrong k in {}",
-        path.display()
-    );
+    assert_eq!(sketch.k(), DEFAULT_K, "wrong k in {}", path.display());
     assert_eq!(
         sketch.n() as usize,
         expected_n,
@@ -100,7 +89,7 @@ fn test_f64_file(path: PathBuf, expected_n: usize) {
     );
     assert_eq!(
         sketch.is_estimation_mode(),
-        expected_n > DEFAULT_K,
+        expected_n > DEFAULT_K as usize,
         "wrong estimation mode in {}",
         path.display()
     );
@@ -134,12 +123,7 @@ fn test_i64_file(path: PathBuf, expected_n: usize) {
     let bytes = fs::read(&path).unwrap();
     let sketch = KllSketch::<i64>::deserialize(&bytes).unwrap();
 
-    assert_eq!(
-        sketch.k() as usize,
-        DEFAULT_K,
-        "wrong k in {}",
-        path.display()
-    );
+    assert_eq!(sketch.k(), DEFAULT_K, "wrong k in {}", path.display());
     assert_eq!(
         sketch.n() as usize,
         expected_n,
@@ -148,7 +132,7 @@ fn test_i64_file(path: PathBuf, expected_n: usize) {
     );
     assert_eq!(
         sketch.is_estimation_mode(),
-        expected_n > DEFAULT_K,
+        expected_n > DEFAULT_K as usize,
         "wrong estimation mode in {}",
         path.display()
     );
@@ -189,12 +173,7 @@ fn test_string_file(path: PathBuf, expected_n: usize) {
     let bytes = fs::read(&path).unwrap();
     let sketch = KllSketch::<String>::deserialize(&bytes).unwrap();
 
-    assert_eq!(
-        sketch.k() as usize,
-        DEFAULT_K,
-        "wrong k in {}",
-        path.display()
-    );
+    assert_eq!(sketch.k(), DEFAULT_K, "wrong k in {}", path.display());
     assert_eq!(
         sketch.n() as usize,
         expected_n,
@@ -203,7 +182,7 @@ fn test_string_file(path: PathBuf, expected_n: usize) {
     );
     assert_eq!(
         sketch.is_estimation_mode(),
-        expected_n > DEFAULT_K,
+        expected_n > DEFAULT_K as usize,
         "wrong estimation mode in {}",
         path.display()
     );
